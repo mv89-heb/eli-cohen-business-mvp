@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import tempfile
+from contextlib import contextmanager
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,6 +139,83 @@ class WorkflowStateStore:
         if self.root is None:
             raise RuntimeError("File paths are unavailable when PostgreSQL persistence is enabled")
         return self.root / f"{workflow_id}.json"
+
+    @contextmanager
+    def claim(self, workflow_id):
+        """Acquire an exclusive per-workflow execution claim across workers/processes."""
+        if not workflow_id or any(
+            ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            for ch in workflow_id
+        ):
+            raise ValueError("Invalid workflow identifier")
+
+        if self.database_url:
+            connection = self._connect()
+            connection.autocommit = True
+            acquired = False
+            try:
+                row = connection.execute(
+                    "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+                    (workflow_id,),
+                ).fetchone()
+                acquired = bool(row and row[0])
+                if not acquired:
+                    raise ProviderError(
+                        "This provisioning workflow is already running in another worker"
+                    )
+                yield
+            finally:
+                if acquired:
+                    try:
+                        connection.execute(
+                            "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                            (workflow_id,),
+                        )
+                    except Exception:
+                        # Closing the PostgreSQL session releases any session-level
+                        # advisory lock even if explicit unlock fails.
+                        pass
+                connection.close()
+            return
+
+        lock_path = self.path_for(workflow_id).with_suffix(".lock")
+        handle = open(lock_path, "a+b")
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                except OSError:
+                    raise ProviderError(
+                        "This provisioning workflow is already running in another process"
+                    ) from None
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError:
+                    raise ProviderError(
+                        "This provisioning workflow is already running in another process"
+                    ) from None
+            yield
+        finally:
+            if locked:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     @staticmethod
     def _safe_state(workflow_id, state):
@@ -571,6 +649,30 @@ class ProvisioningWorkflow:
         }
 
     def run(self, plan, *, github_owner, admin_password, approval,
+            neon_free_tier_verified=False, workflow_url=None):
+        """Serialize Execute for one plan across local processes and remote workers."""
+        if not isinstance(plan, dict):
+            raise ProviderError("Only a valid dry-run provisioning plan can be executed")
+        business = plan.get("business") or {}
+        # Serialize by the durable business identity, not the ephemeral plan id.
+        # A user can generate multiple plans for the same business slug; those
+        # plans must not race to create the same provider resources.
+        workflow_id = business.get("slug") or plan.get("plan_id")
+        if not isinstance(workflow_id, str) or not workflow_id:
+            raise ProviderError("Provisioning plan is missing a workflow identifier")
+        if self.state_store is None:
+            self.state_store = WorkflowStateStore()
+        with self.state_store.claim(workflow_id):
+            return self._run_claimed(
+                plan,
+                github_owner=github_owner,
+                admin_password=admin_password,
+                approval=approval,
+                neon_free_tier_verified=neon_free_tier_verified,
+                workflow_url=workflow_url,
+            )
+
+    def _run_claimed(self, plan, *, github_owner, admin_password, approval,
             neon_free_tier_verified=False, workflow_url=None):
         if approval != "CREATE":
             raise ProviderError("Provisioning requires the explicit confirmation text CREATE")

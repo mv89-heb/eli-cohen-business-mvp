@@ -55,3 +55,21 @@
 - סירוב להתאושש משירות Render שאינו Free, Frankfurt ו־CI-gated.
 
 הבדיקות אינן יוצרות משאבי ענן אמיתיים ואינן מאמתות חיוב או זכאות Free אצל ספק.
+
+
+## מניעת Execute מקביל (Atomic Workflow Claim)
+
+כל הפעלת Execute רוכשת claim בלעדי לפי מזהה workflow לפני טעינת מצב התהליך או ביצוע Preflight/כתיבה. claim מוחזק לאורך כל ההקמה ומשתחרר בבלוק `finally` גם כאשר הפעולה נכשלת.
+
+- כאשר `DATABASE_URL` מוגדר: נעשה שימוש ב־PostgreSQL session-level advisory lock עם `pg_try_advisory_lock(hashtextextended(workflow_id, 0))`. החיבור מוגדר `autocommit` כדי שלא יישאר idle transaction בזמן המתנה ל־API חיצוני. אם lock תפוס, Execute נוסף נדחה ללא שינוי מצב וללא קריאה לספק.
+- במצב קובצי local: נרכש OS file lock על קובץ lock פרטי תחת תיקיית runs. נעילת מערכת ההפעלה משתחררת גם כאשר התהליך מסתיים באופן לא צפוי; קובץ ה־lock עצמו אינו מכיל נתוני לקוח או סוד.
+- הנעילה היא לפי workflow_id; תהליכים עבור מזהים שונים אינם חוסמים זה את זה.
+- הכשל ברכישת claim הוא fail-closed: לא מתבצע ניסיון לטעון או לשנות workflow, ולא נשלחות בקשות יצירה.
+- PostgreSQL advisory lock הוא session-scoped ואינו מבטיח Exactly-Once מול ספקי ענן. הוא מונע שני Execute מקבילים באותו זמן; מנגנון create-intent וההתאוששות הספקית נשארים אחראים לתוצאות עמומות לאחר קריסה.
+
+בדיקות regression מכסות claim מקומי בלעדי ושחרורו, וכן את מסלול advisory lock של PostgreSQL כולל busy-state ושחרור נעילה.
+
+
+### Scope הנעילה: business slug
+
+ה־claim של Execute חייב להשתמש ב־business slug יציב לפני `plan_id`. `plan_id` הוא מזהה של תוכנית/ניסיון תכנון ועלול להשתנות כאשר המפתח מפיק Dry Run חדש לאותו עסק. נעילה לפי `plan_id` בלבד הייתה מאפשרת לשתי תוכניות שונות לאותו slug לרוץ במקביל ולנסות ליצור אותם משאבים. לכן ה־slug משמש מפתח נעילה; `plan_id` נשאר מזהה התיעוד וההתאוששות של התוכנית עצמה. עסק חדש עם slug אחר אינו נחסם.

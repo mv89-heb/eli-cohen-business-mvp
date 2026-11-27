@@ -933,3 +933,85 @@ def test_state_store_persists_recovery_marker_and_operation_intent(tmp_path):
     assert restored["provisioning_marker"] == marker
     assert restored["resource_operations"]["github_repository"]["status"] == "intent"
     assert restored["resource_operations"]["github_repository"]["marker"] == marker
+
+
+def test_workflow_state_store_claim_is_exclusive_and_released(tmp_path):
+    first = WorkflowStateStore(tmp_path / "shared-state")
+    second = WorkflowStateStore(tmp_path / "shared-state")
+
+    with first.claim("plan-lock"):
+        with pytest.raises(ProviderError, match="already running"):
+            with second.claim("plan-lock"):
+                pytest.fail("second workflow unexpectedly acquired the same claim")
+
+    with second.claim("plan-lock"):
+        pass
+
+
+def test_postgres_workflow_claim_uses_session_advisory_lock_and_unlocks():
+    class FakeConnection:
+        def __init__(self, acquired):
+            self.acquired = acquired
+            self.calls = []
+            self.closed = False
+
+        def execute(self, query, params):
+            self.calls.append((query, params))
+            if "pg_try_advisory_lock" in query:
+                acquired = self.acquired
+                return type("Row", (), {"fetchone": lambda self: (acquired,)})()
+            return type("Result", (), {"fetchone": lambda self: (True,)})()
+
+        def close(self):
+            self.closed = True
+
+    store = WorkflowStateStore(database_url="postgresql://unit-test")
+    self_owner = FakeConnection(True)
+    store._connect = lambda: self_owner
+
+    with store.claim("plan-db-lock"):
+        assert self_owner.closed is False
+
+    assert self_owner.closed is True
+    assert any("pg_advisory_unlock" in query for query, _ in self_owner.calls)
+
+    busy = FakeConnection(False)
+    store._connect = lambda: busy
+    with pytest.raises(ProviderError, match="already running"):
+        with store.claim("plan-db-lock"):
+            pytest.fail("busy PostgreSQL claim was unexpectedly acquired")
+    assert busy.closed is True
+
+
+
+def test_execute_claim_is_scoped_to_business_slug_not_ephemeral_plan_id():
+    class CapturedClaim:
+        def __init__(self, key):
+            self.key = key
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    workflow = ProvisioningWorkflow.__new__(ProvisioningWorkflow)
+    claims = []
+    workflow.state_store = type(
+        "Store", (), {"claim": lambda self, key: (claims.append(key) or CapturedClaim(key))}
+    )()
+    workflow._run_claimed = lambda *args, **kwargs: "executed"
+
+    plan = {
+        "plan_id": "a" * 20,
+        "business": {"slug": "customer-acme"},
+    }
+    result = workflow.run(
+        plan,
+        github_owner="developer",
+        admin_password="not-used-in-this-test",
+        approval="CREATE",
+    )
+
+    assert result == "executed"
+    assert claims == ["customer-acme"]
